@@ -8,12 +8,33 @@ const YOUR_EMAIL = "YOUR_EMAIL@gmail.com";
 const GROQ_API_KEY = "YOUR_GROQ_API_KEY";
 
 // ============================================================
+// VALIDATION CONSTANTS
+// ============================================================
+const VALID_CATEGORIES = ["Grocery", "Restaurant", "Clothing", "Transport", "Entertainment", "Income", "Other"];
+const VALID_CARDS = ["Amex", "CIBC", "Cash", "Unknown"];
+const MAX_AMOUNT = 50000;
+
+// ============================================================
+// ENTRY VALIDATION — sanitize LLM output
+// ============================================================
+function sanitizeEntry(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  if (!VALID_CATEGORIES.includes(entry.category)) entry.category = "Other";
+  if (!VALID_CARDS.includes(entry.card)) entry.card = "Unknown";
+  entry.amount = Math.abs(parseFloat(entry.amount));
+  if (isNaN(entry.amount) || entry.amount <= 0 || entry.amount > MAX_AMOUNT) return null;
+  if (!entry.date || isNaN(Date.parse(entry.date))) return null;
+  entry.note = String(entry.note || "").substring(0, 100);
+  return entry;
+}
+
+// ============================================================
 // GROQ: PARSE ALL EXPENSES FROM EMAIL
 // ============================================================
 function parseWithGroq(emailText) {
   const today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
 
-  const prompt = `You are a budget tracking assistant. Extract ALL expenses or income entries from this email and return ONLY a JSON array, no other text, no markdown, no backticks.
+  const systemPrompt = `You are a budget tracking assistant. Extract ALL expenses or income entries from the user's email and return ONLY a JSON array, no other text, no markdown, no backticks.
 
 Today's date: ${today}
 
@@ -33,15 +54,15 @@ Rules:
 - confidence: "high" if category is clear, "low" if uncertain
 
 Return exactly this format (array, even if only one item):
-[{"date":"yyyy-MM-dd","category":"one of the 7 categories","amount":0.00,"note":"short description","card":"Amex or CIBC or Cash or Unknown","confidence":"high or low"}]
-
-Email text:
-${emailText}`;
+[{"date":"yyyy-MM-dd","category":"one of the 7 categories","amount":0.00,"note":"short description","card":"Amex or CIBC or Cash or Unknown","confidence":"high or low"}]`;
 
   const url = "https://api.groq.com/openai/v1/chat/completions";
   const payload = {
     model: "llama-3.1-8b-instant",
-    messages: [{ role: "user", content: prompt }],
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: emailText }
+    ],
     temperature: 0.1,
     max_tokens: 1000
   };
@@ -64,7 +85,7 @@ ${emailText}`;
         const msg = result.error.message || "";
         const isOverloaded = msg.includes("rate limit") || msg.includes("overloaded") || result.error.code === 429;
         if (isOverloaded && attempt < 2) {
-          Logger.log(`⏳ Groq busy, retrying in ${waitSeconds[attempt]}s`);
+          Logger.log(\`⏳ Groq busy, retrying in \${waitSeconds[attempt]}s\`);
           Utilities.sleep(waitSeconds[attempt] * 1000);
           continue;
         }
@@ -89,42 +110,40 @@ ${emailText}`;
 }
 
 // ============================================================
-// LOG TO SHEET — with duplicate detection
+// LOG TO SHEET — with improved duplicate detection
 // Columns: Date | Category | Amount | Note | Card
 // ============================================================
-function logToSheet(date, category, amount, note, card) {
-  const ss = SpreadsheetApp.openById(SHEET_ID);
-  const sheet = ss.getSheetByName(SHEET_NAME);
-  const data = sheet.getDataRange().getValues();
-
+function logToSheet(date, category, amount, note, card, sheet, existingData) {
   const normalizedAmount = parseFloat(parseFloat(amount).toFixed(2));
   const inputDate = new Date(date);
   const inputDateStr = Utilities.formatDate(inputDate, Session.getScriptTimeZone(), "yyyy-MM-dd");
 
-  for (let i = 1; i < data.length; i++) {
-    const rowAmt = parseFloat(parseFloat(data[i][2]).toFixed(2));
+  for (let i = 1; i < existingData.length; i++) {
+    const rowAmt = parseFloat(parseFloat(existingData[i][2]).toFixed(2));
     let rowDateStr = "";
     try {
-      rowDateStr = Utilities.formatDate(new Date(data[i][0]), Session.getScriptTimeZone(), "yyyy-MM-dd");
+      rowDateStr = Utilities.formatDate(new Date(existingData[i][0]), Session.getScriptTimeZone(), "yyyy-MM-dd");
     } catch(e) { continue; }
 
-    if (rowDateStr === inputDateStr && rowAmt === normalizedAmount) {
-      Logger.log(`⚠️ Duplicate skipped: ${inputDateStr} | $${amount}`);
+    if (rowDateStr === inputDateStr && rowAmt === normalizedAmount
+        && existingData[i][1] === category && existingData[i][3] === note) {
+      Logger.log(\`⚠️ Duplicate skipped: \${inputDateStr} | $\${amount}\`);
       return false;
     }
   }
 
   sheet.appendRow([inputDateStr, category, normalizedAmount, note, card || "Unknown"]);
+  existingData.push([inputDateStr, category, normalizedAmount, note, card || "Unknown"]);
   return true;
 }
 
 // ============================================================
-// FAILURE EMAIL — with debug info to paste into Claude
+// FAILURE EMAIL — with truncated body for safety
 // ============================================================
 function sendFailureEmail(subject, body, errorMsg) {
   GmailApp.sendEmail(YOUR_EMAIL,
     "❌ Budget Agent Failed — paste error into Claude",
-    `BUDGET AGENT DEBUG\n\nError: ${errorMsg}\n\nOriginal subject: ${subject}\nOriginal body: ${body}\n\nPaste this into Claude to fix it.`
+    \`BUDGET AGENT DEBUG\n\nError: \${errorMsg}\n\nOriginal subject: \${subject}\nOriginal body (truncated): \${body.substring(0, 300)}\n\nPaste this into Claude to fix it.\`
   );
 }
 
@@ -138,6 +157,16 @@ function processExpenseEmails() {
 
   const threads = GmailApp.search("subject:expense -label:expense-processed newer_than:1d", 0, 20);
 
+  // Read sheet once for all entries
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    Logger.log("❌ Sheet not found: " + SHEET_NAME);
+    GmailApp.sendEmail(YOUR_EMAIL, "❌ Budget Agent Error", "Sheet '" + SHEET_NAME + "' not found. Check SHEET_NAME.");
+    return;
+  }
+  const existingData = sheet.getDataRange().getValues();
+
   for (const thread of threads) {
     // Label IMMEDIATELY — prevents re-processing if script crashes
     thread.addLabel(processedLabel);
@@ -145,7 +174,7 @@ function processExpenseEmails() {
     for (const message of thread.getMessages()) {
       const subject = message.getSubject();
       const body = message.getPlainBody();
-      const emailText = `Subject: ${subject}\n\n${body}`.substring(0, 1500);
+      const emailText = \`Subject: \${subject}\n\n\${body}\`.substring(0, 1500);
 
       const result = parseWithGroq(emailText);
 
@@ -163,12 +192,16 @@ function processExpenseEmails() {
       const loggedItems = [];
 
       for (const entry of result.entries) {
-        if (!entry.amount) continue;
+        const clean = sanitizeEntry(entry);
+        if (!clean) {
+          Logger.log("⚠️ Invalid entry skipped: " + JSON.stringify(entry));
+          continue;
+        }
         try {
-          const wasLogged = logToSheet(entry.date, entry.category, entry.amount, entry.note, entry.card);
+          const wasLogged = logToSheet(clean.date, clean.category, clean.amount, clean.note, clean.card, sheet, existingData);
           if (wasLogged) {
-            loggedItems.push(entry);
-            Logger.log(`✅ Logged: ${entry.date} | ${entry.category} | $${entry.amount} | ${entry.note} | ${entry.card}`);
+            loggedItems.push(clean);
+            Logger.log(\`✅ Logged: \${clean.date} | \${clean.category} | $\${clean.amount} | \${clean.note} | \${clean.card}\`);
           }
         } catch (e) {
           sendFailureEmail(subject, body, "Sheet write failed: " + e.toString());
@@ -191,27 +224,28 @@ function processExpenseEmails() {
           const emoji = emojis[entry.category] || "📦";
           const cardLabel = cardEmojis[entry.card] || "❓ Unknown";
           const flag = entry.confidence === "low" ? " ⚠️" : "";
-          rows += `  ${emoji} ${entry.category.padEnd(13)} $${parseFloat(entry.amount).toFixed(2).padStart(7)}  ${cardLabel}  ${entry.note}${flag}\n`;
+          rows += \`  \${emoji} \${entry.category.padEnd(13)} $\${parseFloat(entry.amount).toFixed(2).padStart(7)}  \${cardLabel}  \${entry.note}\${flag}\n\`;
           total += parseFloat(entry.amount);
         }
 
         GmailApp.sendEmail(YOUR_EMAIL,
-          `✅ ${loggedItems.length} expense${loggedItems.length > 1 ? "s" : ""} logged — $${total.toFixed(2)} total`,
-          `Logged to Budget Tracker:\n\n${rows}\n  ────────────────────────────\n  TOTAL   $${total.toFixed(2)}\n\nView: https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`
+          \`✅ \${loggedItems.length} expense\${loggedItems.length > 1 ? "s" : ""} logged — $\${total.toFixed(2)} total\`,
+          \`Logged to Budget Tracker:\n\n\${rows}\n  ────────────────────────────\n  TOTAL   $\${total.toFixed(2)}\n\nView: https://docs.google.com/spreadsheets/d/\${SHEET_ID}/edit\`
         );
       } else {
-        Logger.log("⚠️ All entries were duplicates. No email sent.");
+        Logger.log("⚠️ All entries were duplicates or invalid. No email sent.");
       }
     }
   }
 }
 
 // ============================================================
-// SPENDING ALERT: 20%+ over last month
+// SPENDING ALERT: 20%+ over last month (min $10 threshold)
 // ============================================================
 function checkSpendingAlerts() {
   const ss = SpreadsheetApp.openById(SHEET_ID);
   const sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) return;
   const data = sheet.getDataRange().getValues();
 
   const now = new Date();
@@ -243,16 +277,16 @@ function checkSpendingAlerts() {
   const alerts = [];
   for (const [cat, thisAmt] of Object.entries(thisMonthTotals)) {
     const lastAmt = lastMonthTotals[cat];
-    if (!lastAmt) continue;
+    if (!lastAmt || lastAmt < 10) continue;
     const pct = ((thisAmt - lastAmt) / lastAmt) * 100;
     if (pct >= 20)
-      alerts.push(`  ${cat}: $${thisAmt.toFixed(2)} this month vs $${lastAmt.toFixed(2)} last month (+${pct.toFixed(0)}%)`);
+      alerts.push(\`  \${cat}: $\${thisAmt.toFixed(2)} this month vs $\${lastAmt.toFixed(2)} last month (+\${pct.toFixed(0)}%)\`);
   }
 
   if (alerts.length > 0) {
     GmailApp.sendEmail(YOUR_EMAIL,
-      `⚠️ Budget Alert: Spending up 20%+ in ${alerts.length} categor${alerts.length > 1 ? "ies" : "y"}`,
-      `More than last month:\n\n${alerts.join("\n")}\n\nView: https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`
+      \`⚠️ Budget Alert: Spending up 20%+ in \${alerts.length} categor\${alerts.length > 1 ? "ies" : "y"}\`,
+      \`More than last month:\n\n\${alerts.join("\n")}\n\nView: https://docs.google.com/spreadsheets/d/\${SHEET_ID}/edit\`
     );
   }
 }
@@ -268,6 +302,7 @@ function sendMonthlyReport() {
 
   const ss = SpreadsheetApp.openById(SHEET_ID);
   const sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) return;
   const data = sheet.getDataRange().getValues();
 
   const categories = {};
@@ -302,27 +337,30 @@ function sendMonthlyReport() {
   let breakdown = "";
   for (const [cat, amt] of Object.entries(categories).sort((a, b) => b[1] - a[1])) {
     const bar = "█".repeat(Math.max(1, Math.round((amt / totalExpenses) * 20)));
-    breakdown += `  ${cat.padEnd(15)} $${amt.toFixed(2).padStart(8)}  ${bar}\n`;
+    breakdown += \`  \${cat.padEnd(15)} $\${amt.toFixed(2).padStart(8)}  \${bar}\n\`;
   }
 
   let cardBreakdown = "";
   for (const [card, amt] of Object.entries(cardTotals).sort((a, b) => b[1] - a[1])) {
-    cardBreakdown += `  ${card.padEnd(10)} $${amt.toFixed(2).padStart(8)}\n`;
+    cardBreakdown += \`  \${card.padEnd(10)} $\${amt.toFixed(2).padStart(8)}\n\`;
   }
 
   GmailApp.sendEmail(YOUR_EMAIL,
-    `📊 Budget Report — ${monthName}`,
-    `BUDGET REPORT — ${monthName}\n${"=".repeat(45)}\n\nEXPENSES BY CATEGORY\n${breakdown || "  None."}\n  ${"─".repeat(41)}\n  TOTAL SPENT      $${totalExpenses.toFixed(2)}\n\nSPENDING BY CARD\n${cardBreakdown || "  None."}\n\nINCOME\n  Total Income     $${totalIncome.toFixed(2)}\n\nSUMMARY\n  Net Savings      $${netSavings.toFixed(2)}  ${netSavings >= 0 ? "✅ On track" : "⚠️ Over budget"}\n  Biggest spend:   ${biggestCat} ($${biggestAmt.toFixed(2)})\n\n${"=".repeat(45)}\nBudget Tracker`
+    \`📊 Budget Report — \${monthName}\`,
+    \`BUDGET REPORT — \${monthName}\n\${"=".repeat(45)}\n\nEXPENSES BY CATEGORY\n\${breakdown || "  None."}\n  \${"─".repeat(41)}\n  TOTAL SPENT      $\${totalExpenses.toFixed(2)}\n\nSPENDING BY CARD\n\${cardBreakdown || "  None."}\n\nINCOME\n  Total Income     $\${totalIncome.toFixed(2)}\n\nSUMMARY\n  Net Savings      $\${netSavings.toFixed(2)}  \${netSavings >= 0 ? "✅ On track" : "⚠️ Over budget"}\n  Biggest spend:   \${biggestCat} ($\${biggestAmt.toFixed(2)})\n\n\${"=".repeat(45)}\nBudget Tracker\`
   );
 }
 
 // ============================================================
-// DAILY CHECK — monthly report + Monday alerts
+// DAILY CHECK — monthly report on 1st, alerts on Monday
 // ============================================================
 function dailyCheck() {
   const now = new Date();
-  const tomorrow = new Date(now);
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  if (tomorrow.getMonth() !== now.getMonth()) sendMonthlyReport();
+  if (now.getDate() === 1) {
+    // Report on previous month
+    const prev = new Date(now);
+    prev.setDate(0);
+    sendMonthlyReport();
+  }
   if (now.getDay() === 1) checkSpendingAlerts();
 }

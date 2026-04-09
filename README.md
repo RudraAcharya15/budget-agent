@@ -7,9 +7,9 @@ AI-powered budget tracker using Google Apps Script, Gmail, Google Sheets, and Gr
 - **Parses expense emails** — send an email with "expense" in the subject, and Groq LLM extracts date, category, amount, card, and note
 - **Logs to Google Sheets** — entries are written to your spreadsheet with duplicate detection
 - **Validates LLM output** — category/card allowlisting, amount caps ($50k), date validation
-- **Sends confirmations** — you get an email summary of what was logged
-- **Weekly spending alerts** — notifies you on Mondays if any category is up 20%+ vs last month
-- **Monthly reports** — auto-generates a spending breakdown on the 1st of each month
+- **HTML email confirmations** — clean, styled confirmation with a table of logged expenses
+- **Weekly spending alerts** — notifies you on Mondays if any category is up 20%+ vs last month (HTML styled)
+- **Monthly reports** — auto-generates a spending breakdown with horizontal bar charts on the 1st of each month
 
 ## Prerequisites
 
